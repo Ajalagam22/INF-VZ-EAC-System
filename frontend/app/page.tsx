@@ -614,7 +614,7 @@ export default function Home() {
     const finalClass = record._override ?? record._classification;
     return filter === "All" || finalClass === filter;
   });
-  const reviewRecords = records.filter((record) => (record._override ?? record._classification) === "Review" || record._confidence < REVIEW_THRESHOLD);
+  const reviewRecords = records.filter((record) => !record._override && ((record._classification) === "Review" || record._confidence < REVIEW_THRESHOLD));
   const feedbackEvents = records.filter((record) => record._override);
 
   const metrics = useMemo(() => {
