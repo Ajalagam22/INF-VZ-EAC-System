@@ -1016,11 +1016,16 @@ select:not(:disabled) {
 
 table {
   width: 100%;
-  max-width: 100%;
   min-width: 1180px;
-  table-layout: fixed;
   border-collapse: collapse;
   background: white;
+}
+
+td.evidence {
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 th,
