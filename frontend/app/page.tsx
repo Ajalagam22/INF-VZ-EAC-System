@@ -1623,16 +1623,16 @@ function RecordsView({
               <thead>
                 <tr>
                   <th style={{ width: 24 }} />
-                  <th>Record</th>
-                  <th>Engineer</th>
+                  <th style={{ width: 120 }}>Record</th>
+                  <th style={{ width: 110 }}>Engineer</th>
                   <th>Activity</th>
-                  <th>Survey Category</th>
-                  <th>Spend</th>
-                  <th>Class</th>
-                  <th>Quality</th>
-                  <th>Confidence</th>
-                  <th>Override</th>
-                  <th>Evidence</th>
+                  <th style={{ width: 140 }}>Survey Category</th>
+                  <th style={{ width: 80 }}>Spend</th>
+                  <th style={{ width: 80 }}>Class</th>
+                  <th style={{ width: 80 }}>Quality</th>
+                  <th style={{ width: 90 }}>Confidence</th>
+                  <th style={{ width: 90 }}>Override</th>
+                  <th style={{ width: 180 }}>Evidence</th>
                 </tr>
               </thead>
               <tbody>

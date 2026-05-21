@@ -1016,7 +1016,9 @@ select:not(:disabled) {
 
 table {
   width: 100%;
+  max-width: 100%;
   min-width: 1180px;
+  table-layout: fixed;
   border-collapse: collapse;
   background: white;
 }
