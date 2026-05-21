@@ -9,7 +9,8 @@ AI-enabled CapEx / OpEx activity classification for the EAC candidate assessment
 - **Active connectors** — Excel workbook (148 records), DOCX form ZIP (10 forms, 39 fields each)
 - **Classification engine** — rule-weighted CapEx / OpEx / Review with confidence score, evidence note, and signal ledger
 - **Agentic pipeline** — Harvesting → Context → Retrieval → Policy → Classification → Routing; full trace visible in Audit Trail
-- **Async LLM pipeline** — single combined Azure OpenAI call per record, 20 concurrent via `asyncio.Semaphore`, chunked in batches of 100; gracefully stubs when no API key is configured
+- **Async LLM pipeline** — single combined Azure OpenAI call per record, up to 20 concurrent via `asyncio.Semaphore`; each record is processed end-to-end as soon as its LLM call returns; gracefully stubs when no API key is configured
+- **Progressive record streaming** — classified records appear in the UI one-by-one as they complete, backed by an in-memory progress store polled every 500 ms
 - **Form Extraction Validation** — field-level side-by-side comparison against Excel mapping; match rate shown per form
 - **Human override + Review Queue** — low-confidence records routed for human correction with audit event
 - **Feedback Learning / Rules & Policies** — governance stubs wired to UI
@@ -78,18 +79,19 @@ Backend pipeline stages:
 |---|---|
 | Connector / extraction | `app/connectors/excel/`, `app/connectors/docx/` |
 | Schema normalisation + quarantine | `app/connectors/*/normalizer.py`, row quality check |
-| Async LLM pre-fetch (chunked, semaphore-gated) | `app/agents/pipeline.py` → `prefetch_llm` |
+| Async LLM pre-fetch (per-record concurrent, semaphore-gated) | `app/agents/pipeline.py` → `prefetch_llm` |
 | Context enrichment | `app/agents/nodes/context.py` |
 | Semantic retrieval | `app/agents/nodes/retrieval.py` |
 | Policy evaluation (GAAP / IAS 16) | `app/agents/nodes/policy.py` |
 | Classification (deterministic, authoritative) | `app/classifiers/hybrid_classifier.py` |
 | Routing | `app/agents/nodes/routing.py` |
+| Progressive record streaming | `app/state/progress_store.py`, `app/orchestrator/flow_orchestrator.py` |
 | Job queue + status polling | `app/models/ingestion_job.py`, `app/orchestrator/flow_orchestrator.py` |
 | Audit event log | `app/audit/audit_service.py` |
 
 ### LLM pipeline design
 
-One combined `litellm.acompletion` call per record replaces the previous 4 sequential calls. The orchestrator pre-fetches all LLM results for a chunk of 100 records concurrently under a shared `asyncio.Semaphore(20)` before running the sync LangGraph pipeline. DB writes stay synchronous throughout — the SQLAlchemy session is never shared across threads or coroutines.
+One combined `litellm.acompletion` call per record replaces the previous 4 sequential calls. Each record runs through a `_classify_one` async coroutine: the LLM call is awaited first (bounded by `asyncio.Semaphore(LLM_CONCURRENCY)`), then the sync LangGraph pipeline executes immediately after, then the record is persisted and pushed to the in-memory progress store. All records are launched concurrently via `asyncio.gather` — each one appears in the UI as soon as its own LLM call returns, rather than waiting for the whole batch. DB writes stay synchronous throughout — the SQLAlchemy session is never shared across coroutines.
 
 Set `LLM_SKIP_THRESHOLD=85` in production to skip LLM for records where the deterministic rules already score ≥ 85% confidence — typically ~70% of a clean dataset — cutting total LLM calls by ~70% with no classification accuracy impact.
 
@@ -118,21 +120,29 @@ Copy `.env.example` to `backend/.env` (and `frontend/.env.local` for the fronten
 | `LLM_API_VERSION` | `2024-12-01-preview` | Azure OpenAI API version |
 | `LLM_MODEL` | `gpt-4o-mini` | Model name (e.g. `gpt-4.1-mini`) |
 | `LLM_SKIP_THRESHOLD` | `0` | Skip LLM for records with deterministic confidence ≥ this value; `0` = never skip |
-| `LLM_CONCURRENCY` | `20` | Max concurrent async LLM calls per chunk |
-| `LLM_CHUNK_SIZE` | `100` | Records per async batch |
+| `LLM_CONCURRENCY` | `20` | Max concurrent async LLM calls via `asyncio.Semaphore` |
 | `LLM_TIMEOUT_SECONDS` | `30` | Per-call timeout |
-| `CORS_ORIGINS` | — | Comma-separated allowed origins; set to your Vercel URL in production |
-| `NEXT_PUBLIC_API_BASE_URL` | `http://127.0.0.1:8001` | Backend URL as seen from the browser |
+| `CORS_ORIGINS` | — | Comma-separated allowed origins; all `*.vercel.app` URLs are permitted automatically |
+| `NEXT_PUBLIC_API_BASE_URL` | `http://127.0.0.1:8001` | Backend URL as seen from the browser (must include `https://` for deployed backends) |
 
 ## Deployment
 
-**Frontend (Vercel):** Set project root to `frontend/`. Set `NEXT_PUBLIC_API_BASE_URL` to your backend URL in the Vercel environment variables dashboard.
+### Backend — Railway
 
-**Backend:** Deploy to any Python host (Railway, Render, Fly.io, Docker). Set `CORS_ORIGINS` to your Vercel frontend URL.
+1. Create a new Railway project and point it at the **`backend/`** directory (Railway cannot traverse `../` paths, so the Dockerfile lives at `backend/Dockerfile`).
+2. Railway injects `PORT` at runtime. The `CMD` in `backend/Dockerfile` already honours it: `uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8001}`.
+3. In Railway's **Networking** tab, set the internal port to **8080** (Railway's default injection value — check the deploy logs if in doubt).
+4. Set environment variables in Railway's **Variables** tab:
+   - `LLM_API_KEY`, `LLM_API_BASE_URL`, `LLM_MODEL`
+   - `CORS_ORIGINS=https://your-app.vercel.app` (all `*.vercel.app` URLs also pass through automatically via regex)
+5. Note the public Railway URL (e.g. `https://inf-vz-eac-system-production.up.railway.app`).
 
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8001
-```
+### Frontend — Vercel
+
+1. Import the repo in Vercel. Set **Root Directory** to `frontend/`.
+2. Vercel detects Next.js automatically via `frontend/vercel.json`.
+3. Add environment variable `NEXT_PUBLIC_API_BASE_URL=https://<your-railway-url>` (include the `https://` scheme).
+4. Deploy. All preview deployments (`*.vercel.app`) are CORS-allowed by the backend automatically.
 
 Ingestion flow: [`docs/ingestion_job_flow.md`](docs/ingestion_job_flow.md).
 

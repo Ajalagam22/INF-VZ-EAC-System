@@ -134,7 +134,8 @@ The production system is organized into eight logical layers. Each layer has a s
 │  LAYER 6: CLASSIFICATION ENGINE                                              │
 │  LangGraph 6-node pipeline — Harvest→Context→Retrieve→Policy→Classify→Route │
 │  Hybrid Classifier — deterministic rules authoritative, LLM advisory        │
-│  Async LLM pre-fetch — asyncio.gather, Semaphore(20), chunked batches        │
+│  Async LLM pre-fetch — per-record _classify_one coroutine, Semaphore(20)    │
+│  Progressive streaming — in-memory progress_store, records pushed on finish  │
 └────────────────────────────┬────────────────────────────────────────────────┘
                              │  SQLAlchemy (sync, WAL)
 ┌────────────────────────────▼────────────────────────────────────────────────┐
@@ -264,7 +265,7 @@ Signals fire in both directions. For every capital-indicating signal, there is a
 
 ### Stage 6: LLM Context Enrichment (Advisory Layer)
 
-This stage runs asynchronously for all records in a chunk of one hundred, using `asyncio.gather` with a shared `asyncio.Semaphore(20)` to bound concurrent Azure OpenAI API calls. The semaphore limit is configurable via `LLM_CONCURRENCY` in the persona configuration. Each record's enriched context is sent to Azure OpenAI in a single combined prompt that requests six outputs simultaneously: investment signals (cues from the record text suggesting capital investment context), organizational context (enriched description of the organizational setting and its relevance to capital classification), classification hints (signals not captured by the rule engine), similar historical patterns (precedents the LLM recognizes from its training), a policy verdict (the LLM's assessment of whether GAAP ASC 350-40 or IAS 16 applies to this specific activity), and an evidence note (a human-readable explanation of the classification rationale that will be shown to the Finance Reviewer).
+This stage runs asynchronously for all records concurrently. Each record is wrapped in a `_classify_one` async coroutine that awaits a single `prefetch_llm` call, then immediately runs the synchronous LangGraph pipeline and persists the result, all within the same coroutine. All coroutines are launched together via `asyncio.gather`; a shared `asyncio.Semaphore(LLM_CONCURRENCY, default 20)` caps the number of in-flight Azure OpenAI calls at any moment. Each record's enriched context is sent to Azure OpenAI in a single combined prompt that requests six outputs simultaneously: investment signals (cues from the record text suggesting capital investment context), organizational context (enriched description of the organizational setting and its relevance to capital classification), classification hints (signals not captured by the rule engine), similar historical patterns (precedents the LLM recognizes from its training), a policy verdict (the LLM's assessment of whether GAAP ASC 350-40 or IAS 16 applies to this specific activity), and an evidence note (a human-readable explanation of the classification rationale that will be shown to the Finance Reviewer).
 
 A critical design constraint governs how the LLM output is used: it is **advisory only**. The LLM's policy verdict and classification hints are incorporated into the confidence score calculation as a bounded adjustment: at most plus or minus twenty confidence points. The LLM cannot change a deterministic CapEx classification to OpEx or vice versa; it can only adjust the confidence score and enrich the evidence note. The final CapEx/OpEx/Review verdict is always the output of the deterministic rules engine. This design constraint exists for two reasons. First, audit defensibility: the classification must be explainable by citing specific signals and the rules that were applied to them, not by referencing a language model's reasoning. Second, model version risk: Azure OpenAI deploys model updates on a rolling basis, and a model update could silently change the LLM's assessment of a record with no change to the source data. If the LLM owned the final verdict, this would mean retroactive changes to classifications that were already produced, audited, and submitted. By keeping the final verdict in the deterministic rules engine, the classification is pinned to the rule version, not the model version.
 
@@ -272,7 +273,7 @@ The LLM skip threshold addresses cost at scale. Records where the deterministic 
 
 ### Stage 7: Classification and Persistence
 
-After the async LLM pre-fetch batch completes for the current chunk, the synchronous LangGraph pipeline runs for each record in sequence. This sequencing, async pre-fetch first, then synchronous graph execution, is a deliberate architectural choice described in detail in Section 7.3. Each graph execution reads the pre-fetched LLM result from the `precomputed_llm` state field, which was injected by the orchestrator before the graph started. The graph does not make any additional I/O calls during execution, all data it needs is already in the state object.
+Within each `_classify_one` coroutine, the synchronous LangGraph pipeline runs immediately after the LLM call resolves, reading the pre-fetched result from the `precomputed_llm` state field. The graph makes no additional I/O calls; all data it needs is already in the state object. Once the graph completes, the record is persisted to the database and pushed to the in-memory `progress_store` (see Section 7.4) — making it visible to the frontend before any other record's processing is complete.
 
 Each classified record is written to the `activity_records` table in PostgreSQL. A corresponding audit event is appended to the `audit_events` table, and eventually to Azure Cosmos DB in the production write path, capturing the full classification context: input signals, rule version, LLM provider and model, confidence score, final classification, routing decision, evidence note, and the complete agent pipeline trace. Neither the record nor the audit event is ever updated after initial write; they are immutable. Human overrides create new audit events that reference the original by event ID.
 
@@ -312,13 +313,27 @@ Using a single LLM model for every record is a blunt instrument that produces ei
 
 Model tier is a per-persona configuration parameter. The routing logic is a single function call in the orchestrator, not a code change when the tier boundaries are adjusted.
 
-### 7.3 Pre-Fetch Design Rationale
+### 7.3 Per-Record Concurrent Processing Design
 
-LangGraph's `invoke()` method is synchronous. Making it async would require either a third-party async LangGraph wrapper, adding an untested dependency, or running each graph invocation in a separate thread with a thread pool, which introduces SQLAlchemy session sharing risks: the SQLAlchemy session is not thread-safe and must never be shared across threads or coroutines.
+LangGraph's `invoke()` method is synchronous. Making it async would require either a third-party async LangGraph wrapper, adding an untested dependency, or a thread pool where each thread owns a separate SQLAlchemy session — introducing connection-pool complexity and session lifetime risks.
 
-The pre-fetch pattern resolves this tension cleanly. The worker's async event loop (owned by `asyncio.run()` in the background processing thread) runs `asyncio.gather` over the full chunk of records, firing all LLM pre-fetch calls concurrently under the shared semaphore. This takes fifteen to thirty seconds for 148 records at twenty concurrent calls. When the gather completes, all results are in memory. The synchronous LangGraph pipeline then runs for each record in sequence, reading its pre-fetched LLM result from the state object with zero I/O wait. The SQLAlchemy session remains synchronous throughout and is never shared between the async event loop and the LangGraph execution.
+The per-record `_classify_one` coroutine pattern resolves this tension. Each coroutine: (1) awaits the async LLM pre-fetch call, yielding to the event loop during network I/O; (2) runs the synchronous LangGraph pipeline in-line once the LLM result is available; (3) persists the record to the database and pushes it to the in-memory progress store. All coroutines are launched at once via `asyncio.gather(*[_classify_one(r) for r in records])`; the `asyncio.Semaphore(LLM_CONCURRENCY)` limits how many LLM calls are in flight simultaneously.
 
-This pattern achieves near-equivalent throughput to a fully async pipeline for the dominant cost, LLM API round-trips, while keeping the deterministic classification logic simple and the database interaction safe.
+The key property: records are not batched. As soon as a coroutine's LLM call returns (typically within 3–10 seconds per record at 20 concurrent), that record proceeds immediately through the full pipeline — classification, DB write, and UI push — without waiting for any other record. This is what produces genuine progressive streaming: the Finance Reviewer sees records appear one by one during processing rather than all at once at the end.
+
+The SQLAlchemy session remains synchronous throughout and is never touched by the async event loop. The sync LangGraph execution within a coroutine blocks the event loop momentarily, but since LangGraph runs in microseconds after the LLM result is in memory, this does not meaningfully impede the concurrency of the other coroutines awaiting their LLM calls.
+
+### 7.4 In-Memory Progress Store for Progressive Streaming
+
+The progressive streaming architecture uses an in-memory store (`app/state/progress_store.py`) as the intermediary between the backend orchestrator and the frontend polling loop. This design decision was driven by a fundamental limitation of relational database transaction isolation.
+
+**Why the database cannot serve progressive results directly.** The SQLAlchemy session used during classification accumulates writes that are only committed in bulk (every ten records, and at run completion). Even if committed more frequently, a second database session used by the API endpoint to serve polling requests would not see uncommitted data from the orchestrator's session. In WAL mode with SQLite, and with read-committed isolation in PostgreSQL, the polling endpoint cannot see records that are in the orchestrator's in-flight transaction. The in-memory store bypasses this entirely: it is written by the orchestrator synchronously the moment each record is classified, and read by the API endpoint without any transaction boundary between them.
+
+**Design.** `progress_store.py` is a module-level dict guarded by a `threading.Lock`. The orchestrator calls `progress_store.push(run_id, [record])` after each record completes. The API endpoint `GET /api/records/run/{run_id}?offset=N` calls `progress_store.get(run_id, offset=N)` to return only the records the frontend has not yet seen. The frontend polls this endpoint every 500 ms during processing and appends new records to the table as they arrive.
+
+**Trade-off.** The in-memory store is process-local. In a multi-replica deployment (multiple API containers), the polling request must hit the same replica as the orchestrator. In the current single-worker deployment, this is guaranteed. For multi-worker scale-out, the store would be replaced with a Redis list or a Server-Sent Events stream — the interface (`push` / `get`) is narrow enough that this substitution requires no orchestrator changes.
+
+---
 
 ---
 
@@ -390,7 +405,7 @@ Every stub in the current POC has a defined production replacement path. The tab
 | Audit archive | SQLite audit_events table | Append-only Cosmos DB + change feed mirror | Azure Cosmos DB |
 | Authentication | None (dev mode) | Entra ID OIDC | MSAL + Bearer token validation |
 | LLM rate limiting | asyncio.Semaphore(20) in-process | Azure OpenAI PTU + APIM rate limit policy | Azure API Management |
-| CORS policy | FastAPI middleware | Front Door WAF policy | Azure Front Door |
+| CORS policy | FastAPI middleware + `allow_origin_regex` for `*.vercel.app` | Front Door WAF policy | Azure Front Door |
 | CI/CD | Manual file copy | GitHub Actions → ACR → Container Apps | GitHub Actions + ACR |
 | Form extraction | Regex parser | Azure Document Intelligence trained model | Azure Document Intelligence |
 
@@ -424,13 +439,15 @@ Combining all four outputs into a single structured prompt reduced the call coun
 
 The tradeoff is a larger input token count per call, approximately 1,500 tokens per combined call versus 400 tokens per individual call. At the output token limit of 500 tokens, the combined response is bounded and the cost increase is approximately 3× per call rather than 4×. The net result is a 75% reduction in API calls and a 25% reduction in total token cost.
 
-### Decision 4: Pre-Fetch Pattern (Async Before Sync Graph)
+### Decision 4: Per-Record Concurrent Processing (Async + Sync Interleaved per Coroutine)
 
-The pre-fetch pattern, running all LLM calls asynchronously for a full chunk before any LangGraph execution begins, is the mechanism that achieves LLM parallelism without making the classification logic async.
+The per-record `_classify_one` coroutine pattern achieves two goals simultaneously: LLM parallelism without making classification logic async, and genuine per-record progressive streaming.
 
-LangGraph's `invoke()` is synchronous by design. Running multiple graph invocations concurrently would require either a third-party async wrapper with no production pedigree, or a thread pool where each thread owns a separate SQLAlchemy session and database connection. The thread pool approach would work but adds substantial complexity to the connection pooling configuration and requires careful management of session lifetimes across threads.
+Each coroutine owns its own lifecycle: await the LLM call, then run the sync LangGraph pipeline, then persist and push to the UI store. All coroutines are launched via `asyncio.gather` with a shared semaphore bounding concurrency. This differs from the previous chunk-based design, where all LLM calls were pre-fetched for a full batch before any LangGraph execution started. The chunk-based design forced records to queue up waiting for the entire batch's LLM phase to complete, which meant users saw zero records for 15–30 seconds, then all records at once.
 
-The pre-fetch pattern avoids this entirely. The async event loop, owned by `asyncio.run()` in the worker thread, runs the LLM pre-fetch phase. When it completes, the event loop exits and the worker thread proceeds to run synchronous LangGraph invocations using the pre-fetched results. At no point do the async and sync phases overlap. The SQLAlchemy session is created in the synchronous phase and never touched by the async event loop. This separation of concerns is clean enough to reason about and audit, which matters for a system that needs to be maintained by engineers who may not have designed it.
+The per-record approach means each record appears in the UI as soon as its own LLM call returns. At 20 concurrent calls against Azure OpenAI, the first records typically appear within 3–10 seconds of upload completion; the full dataset of 148 records completes in 15–30 seconds with records trickling in throughout.
+
+The SQLAlchemy session is created in the `asyncio.run()` synchronous wrapper and passed into the async phase. It is written only from within the `_classify_one` coroutine's synchronous steps — LangGraph execution and database persistence — never from the async event loop itself. The session is never shared between coroutines; each write is serialized by the event loop's single-threaded execution model.
 
 ### Decision 5: PostgreSQL + pgvector over Dedicated Vector Store
 
