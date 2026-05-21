@@ -16,6 +16,7 @@ from app.connectors.excel.excel_connector import ExcelConnector
 from app.config.settings import get_settings
 from app.models.activity_record import ActivityRecord, BatchRun
 from app.schemas.activity_schema import RunManifest
+from app.state import progress_store
 
 
 def _chunks(lst: List[Any], size: int) -> Iterator[List[Any]]:
@@ -120,6 +121,7 @@ class FlowOrchestrator:
                 quarantined_record["_reviewReason"] = "; ".join(row_quality.get("issues") or ["Row quality checks failed."])
                 persisted = self._persist_record(db, run_id, filename, quarantined_record)
                 classified_records.append(persisted)
+                progress_store.push(run_id, [persisted])
                 self.audit.record_event(
                     db,
                     run_id=run_id,
@@ -170,6 +172,7 @@ class FlowOrchestrator:
 
                 persisted = self._persist_record(db, run_id, filename, classified)
                 classified_records.append(persisted)
+                progress_store.push(run_id, [persisted])
                 self.audit.record_event(
                     db,
                     run_id=run_id,

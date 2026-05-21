@@ -10,6 +10,7 @@ from app.models.activity_record import ActivityRecord, AuditEvent, BatchRun
 from app.models.ingestion_job import IngestionJob
 from app.schemas.activity_schema import APIMessage, OverrideRequest
 from app.services.classification_service import ClassificationService
+from app.state import progress_store
 
 router = APIRouter()
 service = ClassificationService()
@@ -21,16 +22,9 @@ def list_records(limit: int = 500, db: Session = Depends(get_db)) -> Dict[str, A
 
 
 @router.get("/records/run/{run_id}")
-def list_records_by_run(run_id: str, offset: int = 0, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    rows = (
-        db.query(ActivityRecord)
-        .filter(ActivityRecord.run_id == run_id)
-        .order_by(ActivityRecord.id)
-        .offset(offset)
-        .limit(500)
-        .all()
-    )
-    return {"records": [service._serialize_record(r) for r in rows], "count": len(rows)}
+def list_records_by_run(run_id: str, offset: int = 0) -> Dict[str, Any]:
+    records = progress_store.get(run_id, offset=offset)
+    return {"records": records, "count": len(records)}
 
 
 @router.get("/runs/latest")
