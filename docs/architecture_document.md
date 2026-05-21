@@ -313,27 +313,25 @@ Using a single LLM model for every record is a blunt instrument that produces ei
 
 Model tier is a per-persona configuration parameter. The routing logic is a single function call in the orchestrator, not a code change when the tier boundaries are adjusted.
 
-### 7.3 Per-Record Concurrent Processing Design
+### 7.3 Two Processing Modes: POC Streaming vs. Production Batch
 
-LangGraph's `invoke()` method is synchronous. Making it async would require either a third-party async LangGraph wrapper, adding an untested dependency, or a thread pool where each thread owns a separate SQLAlchemy session — introducing connection-pool complexity and session lifetime risks.
+The orchestrator supports two distinct processing strategies. The correct choice depends on whether a human is watching the UI:
 
-The per-record `_classify_one` coroutine pattern resolves this tension. Each coroutine: (1) awaits the async LLM pre-fetch call, yielding to the event loop during network I/O; (2) runs the synchronous LangGraph pipeline in-line once the LLM result is available; (3) persists the record to the database and pushes it to the in-memory progress store. All coroutines are launched at once via `asyncio.gather(*[_classify_one(r) for r in records])`; the `asyncio.Semaphore(LLM_CONCURRENCY)` limits how many LLM calls are in flight simultaneously.
+**POC / interactive upload (current implementation).** A Finance admin uploads a file and watches records appear in real time. Each record runs through a `_classify_one` async coroutine that: (1) awaits the LLM pre-fetch call; (2) runs the synchronous LangGraph pipeline immediately once the result is available; (3) persists the record and pushes it to the in-memory progress store. All coroutines are launched concurrently via `asyncio.gather`; a `asyncio.Semaphore(LLM_CONCURRENCY)` bounds in-flight LLM calls. Records stream into the UI one by one as their individual LLM calls return — typically 3–10 seconds of latency before the first record appears, with the full 148-record set completing in 15–30 seconds. The SQLAlchemy session remains synchronous and is never touched by the async event loop.
 
-The key property: records are not batched. As soon as a coroutine's LLM call returns (typically within 3–10 seconds per record at 20 concurrent), that record proceeds immediately through the full pipeline — classification, DB write, and UI push — without waiting for any other record. This is what produces genuine progressive streaming: the Finance Reviewer sees records appear one by one during processing rather than all at once at the end.
+**Production nightly batch (target architecture).** No human is watching the UI during a 02:00 UTC batch run, so per-record streaming adds no value. The batch worker uses chunk-based processing: LLM calls for a chunk of 100 records are pre-fetched concurrently (`asyncio.gather` + semaphore), then when all 100 results are in memory, the synchronous LangGraph pipeline runs for each record in sequence, and all 100 rows are bulk-inserted in a single commit. This yields better database throughput (fewer round-trips), simpler event loop management, and compatibility with multi-replica worker deployments — the in-memory progress store is process-local and does not work across KEDA-scaled worker replicas.
 
-The SQLAlchemy session remains synchronous throughout and is never touched by the async event loop. The sync LangGraph execution within a coroutine blocks the event loop momentarily, but since LangGraph runs in microseconds after the LLM result is in memory, this does not meaningfully impede the concurrency of the other coroutines awaiting their LLM calls.
+LangGraph's `invoke()` is synchronous by design. Both modes avoid the complexity of a thread pool with shared SQLAlchemy sessions by keeping all database writes in the synchronous phase, after the async LLM gather completes.
 
-### 7.4 In-Memory Progress Store for Progressive Streaming
+### 7.4 In-Memory Progress Store (POC)
 
-The progressive streaming architecture uses an in-memory store (`app/state/progress_store.py`) as the intermediary between the backend orchestrator and the frontend polling loop. This design decision was driven by a fundamental limitation of relational database transaction isolation.
+The POC interactive path uses an in-memory store (`app/state/progress_store.py`) as the intermediary between the orchestrator and the frontend polling loop. This is a POC-specific design; production uses the database directly after the batch run completes.
 
-**Why the database cannot serve progressive results directly.** The SQLAlchemy session used during classification accumulates writes that are only committed in bulk (every ten records, and at run completion). Even if committed more frequently, a second database session used by the API endpoint to serve polling requests would not see uncommitted data from the orchestrator's session. In WAL mode with SQLite, and with read-committed isolation in PostgreSQL, the polling endpoint cannot see records that are in the orchestrator's in-flight transaction. The in-memory store bypasses this entirely: it is written by the orchestrator synchronously the moment each record is classified, and read by the API endpoint without any transaction boundary between them.
+**Why the database cannot serve progressive results during processing.** The SQLAlchemy session accumulates writes that are committed in bulk. A second session used by the API polling endpoint cannot see uncommitted data from the orchestrator's in-flight transaction, due to read-committed isolation in both SQLite WAL and PostgreSQL. The in-memory store bypasses this: it is written the moment each record is classified, before any DB commit, and read without any transaction boundary.
 
-**Design.** `progress_store.py` is a module-level dict guarded by a `threading.Lock`. The orchestrator calls `progress_store.push(run_id, [record])` after each record completes. The API endpoint `GET /api/records/run/{run_id}?offset=N` calls `progress_store.get(run_id, offset=N)` to return only the records the frontend has not yet seen. The frontend polls this endpoint every 500 ms during processing and appends new records to the table as they arrive.
+**Design.** `progress_store.py` is a module-level dict guarded by a `threading.Lock`. The orchestrator calls `progress_store.push(run_id, [record])` after each record completes. The API endpoint `GET /api/records/run/{run_id}?offset=N` returns only the records the frontend has not yet seen. The frontend polls every 500 ms during processing.
 
-**Trade-off.** The in-memory store is process-local. In a multi-replica deployment (multiple API containers), the polling request must hit the same replica as the orchestrator. In the current single-worker deployment, this is guaranteed. For multi-worker scale-out, the store would be replaced with a Redis list or a Server-Sent Events stream — the interface (`push` / `get`) is narrow enough that this substitution requires no orchestrator changes.
-
----
+**Production replacement.** The in-memory store is process-local and incompatible with multi-replica deployments. In production the batch worker writes results to the database in bulk; the frontend loads the completed run from `GET /api/records` after the job status transitions to `completed`. If real-time progress reporting were required in production, the `push`/`get` interface is narrow enough to be backed by a Redis list with no orchestrator changes.
 
 ---
 
@@ -439,15 +437,15 @@ Combining all four outputs into a single structured prompt reduced the call coun
 
 The tradeoff is a larger input token count per call, approximately 1,500 tokens per combined call versus 400 tokens per individual call. At the output token limit of 500 tokens, the combined response is bounded and the cost increase is approximately 3× per call rather than 4×. The net result is a 75% reduction in API calls and a 25% reduction in total token cost.
 
-### Decision 4: Per-Record Concurrent Processing (Async + Sync Interleaved per Coroutine)
+### Decision 4: Processing Strategy — Per-Record Streaming (POC) vs. Chunk-Based Batch (Production)
 
-The per-record `_classify_one` coroutine pattern achieves two goals simultaneously: LLM parallelism without making classification logic async, and genuine per-record progressive streaming.
+Two processing strategies exist for the async-then-sync pipeline. The choice is driven by whether a human is watching the UI.
 
-Each coroutine owns its own lifecycle: await the LLM call, then run the sync LangGraph pipeline, then persist and push to the UI store. All coroutines are launched via `asyncio.gather` with a shared semaphore bounding concurrency. This differs from the previous chunk-based design, where all LLM calls were pre-fetched for a full batch before any LangGraph execution started. The chunk-based design forced records to queue up waiting for the entire batch's LLM phase to complete, which meant users saw zero records for 15–30 seconds, then all records at once.
+**Per-record streaming (POC interactive path).** Each record runs through a `_classify_one` coroutine: await LLM → run LangGraph → persist → push to progress store. Records appear in the UI one by one as their LLM calls return. This is the right model when a Finance admin has uploaded a file and is actively watching the dashboard. The cost is more frequent, smaller DB writes (one commit per record rather than one per chunk).
 
-The per-record approach means each record appears in the UI as soon as its own LLM call returns. At 20 concurrent calls against Azure OpenAI, the first records typically appear within 3–10 seconds of upload completion; the full dataset of 148 records completes in 15–30 seconds with records trickling in throughout.
+**Chunk-based batch (production nightly path).** All LLM calls for a chunk of 100 records are pre-fetched concurrently before any LangGraph execution begins. When the pre-fetch gather completes, all 100 results are in memory and the LangGraph pipeline runs for each record sequentially. The 100 rows are bulk-inserted in a single commit. This is the right model for the overnight batch: no one is watching the UI, multi-replica KEDA workers make the in-memory progress store unworkable, and bulk inserts are significantly more efficient at scale.
 
-The SQLAlchemy session is created in the `asyncio.run()` synchronous wrapper and passed into the async phase. It is written only from within the `_classify_one` coroutine's synchronous steps — LangGraph execution and database persistence — never from the async event loop itself. The session is never shared between coroutines; each write is serialized by the event loop's single-threaded execution model.
+Both strategies keep the SQLAlchemy session synchronous and never shared across coroutines or threads. In both cases, the `asyncio.Semaphore(LLM_CONCURRENCY)` bounds the number of concurrent Azure OpenAI calls.
 
 ### Decision 5: PostgreSQL + pgvector over Dedicated Vector Store
 
