@@ -20,6 +20,19 @@ def list_records(limit: int = 500, db: Session = Depends(get_db)) -> Dict[str, A
     return {"records": service.list_records(db, limit=limit)}
 
 
+@router.get("/records/run/{run_id}")
+def list_records_by_run(run_id: str, offset: int = 0, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    rows = (
+        db.query(ActivityRecord)
+        .filter(ActivityRecord.run_id == run_id)
+        .order_by(ActivityRecord.id)
+        .offset(offset)
+        .limit(500)
+        .all()
+    )
+    return {"records": [service._serialize_record(r) for r in rows], "count": len(rows)}
+
+
 @router.get("/runs/latest")
 def latest_run(db: Session = Depends(get_db)) -> Dict[str, Any]:
     return {"run": service.latest_run(db)}

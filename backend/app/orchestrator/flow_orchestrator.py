@@ -92,6 +92,7 @@ class FlowOrchestrator:
                 return
             progress_callback(
                 {
+                    "run_id": run_id,
                     "stage": stage,
                     "processed": processed,
                     "classified": len(classified_records),

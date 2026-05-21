@@ -725,32 +725,51 @@ export default function Home() {
     return response.json();
   }
 
-  async function waitForJob(job: IngestionJobSubmission, label: string): Promise<IngestionJobStatus> {
+  async function waitForJob(
+    job: IngestionJobSubmission,
+    label: string,
+    onPartialRecords?: (records: ClassifiedRecord[], sourceType: string) => void
+  ): Promise<IngestionJobStatus> {
     const statusUrl = `${appConfig.apiBaseUrl}${job.status_url}`;
     let lastStage = job.stage;
+    let runId: string | null = null;
+    let seenCount = 0;
+
     for (let attempt = 0; attempt < 600; attempt += 1) {
       const response = await fetch(statusUrl);
-      if (!response.ok) {
-        throw new Error(await response.text());
-      }
-      const state = (await response.json()) as IngestionJobStatus;
+      if (!response.ok) throw new Error(await response.text());
+      const state = (await response.json()) as IngestionJobStatus & { run_id?: string };
+
+      if (state.run_id && !runId) runId = state.run_id;
+
       if (state.stage && state.stage !== lastStage) {
         setStatus(`${label} ${state.stage}...`);
         lastStage = state.stage;
       } else if (state.status === "processing") {
-        setStatus(`${label} processing ${state.processed} record${state.processed === 1 ? "" : "s"}...`);
+        setStatus(`${label} ${state.classified ?? 0} of ~${state.processed ?? 0} records classified...`);
       } else if (state.status === "queued") {
         setStatus(`${label} queued...`);
       }
+
+      // Fetch and stream partial records as they are classified
+      if (runId && onPartialRecords && state.status === "processing" && (state.classified ?? 0) > seenCount) {
+        try {
+          const partial = await fetch(`${appConfig.apiBaseUrl}/api/records/run/${runId}?offset=${seenCount}`);
+          if (partial.ok) {
+            const { records: newRecords } = await partial.json();
+            if (newRecords?.length) {
+              seenCount += newRecords.length;
+              onPartialRecords(newRecords, job.source_type);
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+
       if (state.status === "completed") {
-        if (!state.result) {
-          throw new Error("Ingestion job completed without a result payload.");
-        }
+        if (!state.result) throw new Error("Ingestion job completed without a result payload.");
         return state;
       }
-      if (state.status === "failed") {
-        return state;
-      }
+      if (state.status === "failed") return state;
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     throw new Error("Timed out waiting for the ingestion job to complete.");
@@ -793,12 +812,21 @@ export default function Home() {
       setExcelWorkbookSections(workbookSections);
       const submission = (await postFile("/api/upload/excel", file)) as IngestionJobSubmission;
       setStatus(`Excel ingestion job ${submission.job_id} queued. Waiting for the worker...`);
-      const completed = await waitForJob(submission, "Excel ingestion");
+      const mappings = workbookSections.mappingRows.length ? workbookSections.mappingRows : workbookSections.datasetRows;
+      const completed = await waitForJob(submission, "Excel ingestion", (partial) => {
+        const hydrated = partial.map((r, i) => ({ ...r, _id: r._id ?? r._recordUid ?? `Excel-partial-${i}` }));
+        setExcelRecords((prev) => {
+          const seen = new Set(prev.map((r) => r._recordUid));
+          return [...prev, ...hydrated.filter((r) => !seen.has(r._recordUid))];
+        });
+        setValidations(buildFormValidations(formRecords, mappings));
+        if (!selectedId) setSelectedId(hydrated[0]?._id ?? "");
+      });
       if (completed.status === "failed") {
         throw new Error(completed.error ?? "Excel ingestion job failed");
       }
       const records = completed.result?.records ?? [];
-      hydrateExcelRecords(records, completed.result?.source_file_name ?? file.name, workbookSections.mappingRows.length ? workbookSections.mappingRows : workbookSections.datasetRows);
+      hydrateExcelRecords(records, completed.result?.source_file_name ?? file.name, mappings);
       return { count: records.length, elapsed: completed.result?.elapsed_seconds ?? 0 };
     } catch {
       const XLSX = await import("xlsx");

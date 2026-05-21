@@ -116,6 +116,8 @@ class IngestionJobService:
         job.escalated = int(progress.get("escalated", job.escalated))
         job.failed = int(progress.get("failed", job.failed))
         job.matched_excel = int(progress.get("matched_excel", job.matched_excel))
+        if progress.get("run_id") and not job.run_id:
+            job.run_id = progress["run_id"]
         db.add(job)
         db.commit()
 
