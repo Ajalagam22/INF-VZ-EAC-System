@@ -134,65 +134,59 @@ class FlowOrchestrator:
 
         emit_progress("classifying records")
 
-        # Shared semaphore caps concurrent LLM calls across all chunks
+        # Semaphore caps concurrent LLM calls; process each record as its LLM call finishes
         semaphore = asyncio.Semaphore(self.settings.llm_concurrency)
 
-        for chunk in _chunks(to_classify, self.settings.llm_chunk_size):
-            # Pre-fetch all LLM analyses for this chunk concurrently
-            prefetched_raw = await asyncio.gather(
-                *[self.agentic_pipeline.prefetch_llm(r, source_type, semaphore) for r in chunk],
-                return_exceptions=True,
+        async def _classify_one(record: Dict[str, Any]) -> None:
+            nonlocal escalated
+            llm_data = await self.agentic_pipeline.prefetch_llm(record, source_type, semaphore)
+            precomp = llm_data if isinstance(llm_data, dict) else {}
+            try:
+                classified = self.agentic_pipeline.execute(record, source_type, precomputed_llm=precomp).record
+            except Exception as exc:
+                classified = dict(record)
+                classified["_classification"] = "Review"
+                classified["_confidence"] = 0
+                classified["_evidence"] = f"Pipeline exception: {exc}"
+                classified["_reviewReason"] = "Unhandled pipeline error — manual review required."
+                classified["_routingState"] = "review"
+                classified["_agentTrace"] = {
+                    "provider": "error",
+                    "model": "",
+                    "steps": [{"agent": "Pipeline", "status": "failed", "summary": str(exc), "provider": "error", "output": {}}],
+                }
+
+            if source_type != "Excel" and matched_excel:
+                classified["_matchedExcel"] = int(classified["_key"] in matched_excel)
+            else:
+                classified["_matchedExcel"] = 1 if source_type == "Excel" else 0
+            if classified["_classification"] == "Review" or classified["_confidence"] < self.settings.review_threshold:
+                escalated += 1
+
+            persisted = self._persist_record(db, run_id, filename, classified)
+            classified_records.append(persisted)
+            progress_store.push(run_id, [persisted])
+            self.audit.record_event(
+                db,
+                run_id=run_id,
+                record_uid=persisted["_recordUid"],
+                event_type="classified",
+                payload={
+                    "classification": persisted["_classification"],
+                    "confidence": persisted["_confidence"],
+                    "evidence": persisted["_evidence"],
+                    "signals": persisted["_signals"],
+                    "matched_excel": persisted["_matchedExcel"],
+                    "agent_trace": persisted.get("_agentTrace"),
+                },
             )
-            prefetched = [r if isinstance(r, dict) else {} for r in prefetched_raw]
+            if len(classified_records) % 10 == 0:
+                db.commit()
+                emit_progress("classifying records")
 
-            # Process each record through the sync graph — no I/O, just CPU
-            for record, llm_data in zip(chunk, prefetched):
-                precomp = llm_data if isinstance(llm_data, dict) else {}
-                try:
-                    classified = self.agentic_pipeline.execute(record, source_type, precomputed_llm=precomp).record
-                except Exception as exc:
-                    classified = dict(record)
-                    classified["_classification"] = "Review"
-                    classified["_confidence"] = 0
-                    classified["_evidence"] = f"Pipeline exception: {exc}"
-                    classified["_reviewReason"] = "Unhandled pipeline error — manual review required."
-                    classified["_routingState"] = "review"
-                    classified["_agentTrace"] = {
-                        "provider": "error",
-                        "model": "",
-                        "steps": [{"agent": "Pipeline", "status": "failed", "summary": str(exc), "provider": "error", "output": {}}],
-                    }
-
-                if source_type != "Excel" and matched_excel:
-                    classified["_matchedExcel"] = int(classified["_key"] in matched_excel)
-                else:
-                    classified["_matchedExcel"] = 1 if source_type == "Excel" else 0
-                if classified["_classification"] == "Review" or classified["_confidence"] < self.settings.review_threshold:
-                    escalated += 1
-
-                persisted = self._persist_record(db, run_id, filename, classified)
-                classified_records.append(persisted)
-                progress_store.push(run_id, [persisted])
-                self.audit.record_event(
-                    db,
-                    run_id=run_id,
-                    record_uid=persisted["_recordUid"],
-                    event_type="classified",
-                    payload={
-                        "classification": persisted["_classification"],
-                        "confidence": persisted["_confidence"],
-                        "evidence": persisted["_evidence"],
-                        "signals": persisted["_signals"],
-                        "matched_excel": persisted["_matchedExcel"],
-                        "agent_trace": persisted.get("_agentTrace"),
-                    },
-                )
-                # Commit every 10 records so the polling endpoint can see them
-                if len(classified_records) % 10 == 0:
-                    db.commit()
-                    emit_progress("classifying records")
-
-            emit_progress("classifying records")
+        # Fire all records concurrently — each is pushed to the store as soon as its LLM call returns
+        await asyncio.gather(*[_classify_one(r) for r in to_classify], return_exceptions=True)
+        emit_progress("classifying records")
 
         elapsed = time.time() - start
         manifest = RunManifest(
