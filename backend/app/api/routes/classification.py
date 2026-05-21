@@ -1,0 +1,40 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.database.session import get_db
+from app.models.activity_record import ActivityRecord, AuditEvent, BatchRun
+from app.models.ingestion_job import IngestionJob
+from app.schemas.activity_schema import APIMessage, OverrideRequest
+from app.services.classification_service import ClassificationService
+
+router = APIRouter()
+service = ClassificationService()
+
+
+@router.get("/records")
+def list_records(limit: int = 500, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return {"records": service.list_records(db, limit=limit)}
+
+
+@router.get("/runs/latest")
+def latest_run(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return {"run": service.latest_run(db)}
+
+
+@router.get("/summary")
+def summary(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return service.summary(db)
+
+
+@router.get("/audit/{record_uid}")
+def audit_timeline(record_uid: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return {"events": service.audit_timeline(db, record_uid)}
+
+
+@router.post("/records/{record_uid}/override")
+def override_record(record_uid: str, request: OverrideRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return service.override_record(db, record_uid, request)
