@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Employee Activity Classification System",
+  title: "EAC",
   description: "AI-enabled CapEx / OpEx employee activity classification system"
 };
 
