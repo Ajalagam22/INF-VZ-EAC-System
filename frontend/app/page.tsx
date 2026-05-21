@@ -1004,7 +1004,7 @@ export default function Home() {
             )}
           </div>
           <div>
-            <h1>{appConfig.brandName}</h1>
+            <h1>EAC</h1>
             {appConfig.brandSubtitle ? <span>{appConfig.brandSubtitle}</span> : null}
           </div>
         </div>
