@@ -131,15 +131,24 @@ class FlowOrchestrator:
 
         emit_progress("classifying records")
 
-        # Shared semaphore caps concurrent LLM calls across all chunks
-        semaphore = asyncio.Semaphore(self.settings.llm_concurrency)
+        # Semaphore limits concurrent batch LLM calls
+        batch_size = max(1, self.settings.llm_batch_size)
+        semaphore = asyncio.Semaphore(max(1, self.settings.llm_concurrency // batch_size))
 
         for chunk in _chunks(to_classify, self.settings.llm_chunk_size):
-            # Pre-fetch all LLM analyses for this chunk concurrently
-            prefetched = await asyncio.gather(
-                *[self.agentic_pipeline.prefetch_llm(r, source_type, semaphore) for r in chunk],
+            # Group into sub-batches and fire all batches concurrently
+            sub_batches = list(_chunks(chunk, batch_size))
+            batch_results = await asyncio.gather(
+                *[self.agentic_pipeline.prefetch_llm_batch(b, source_type, semaphore) for b in sub_batches],
                 return_exceptions=True,
             )
+            # Flatten batch results back into per-record list
+            prefetched = []
+            for res in batch_results:
+                if isinstance(res, list):
+                    prefetched.extend(res)
+                else:
+                    prefetched.extend([{}] * batch_size)
 
             # Process each record through the sync graph — no I/O, just CPU
             for record, llm_data in zip(chunk, prefetched):

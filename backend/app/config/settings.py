@@ -70,6 +70,7 @@ class Settings:
     llm_skip_threshold: int = _as_int(os.getenv("LLM_SKIP_THRESHOLD"), 85)
     llm_concurrency: int = _as_int(os.getenv("LLM_CONCURRENCY"), 20)
     llm_chunk_size: int = _as_int(os.getenv("LLM_CHUNK_SIZE"), 100)
+    llm_batch_size: int = _as_int(os.getenv("LLM_BATCH_SIZE"), 10)
     llm_provider: str = os.getenv("LLM_PROVIDER", "azure_openai")
     llm_api_base_url: str = os.getenv("LLM_API_BASE_URL", "")
     llm_api_key: str = os.getenv("LLM_API_KEY", "")

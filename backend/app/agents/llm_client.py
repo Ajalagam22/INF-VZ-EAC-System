@@ -88,7 +88,79 @@ class LLMClient:
             content=parsed or self._stub_combined(record), raw_text=text
         )
 
-    async def _chat_completion_async(self, prompt: str) -> str:
+    async def analyze_batch_async(
+        self,
+        records: list,
+        signals_list: list,
+        semaphore: "asyncio.Semaphore | None" = None,
+    ) -> list:
+        """Send multiple records in one API call and return one result dict per record."""
+        import asyncio as _asyncio
+        n = len(records)
+        if not self.available_async or n == 0:
+            return [self._stub_combined(r) for r in records]
+        prompt = (
+            f"You are an enterprise capital labor classification agent. "
+            f"Analyze these {n} employee activity records and return a JSON ARRAY of exactly {n} objects "
+            "in the same order. Each object must have ALL of these keys: "
+            "investment_signals (list), org_context (string), classification_hints (list), "
+            "enrichment_notes (string), similar_patterns (list), "
+            "precedent_classification (CapEx|OpEx|Review), similarity_score (0-100 integer), "
+            "retrieval_notes (string), policy_verdict (capitalize|expense|uncertain), "
+            "policy_rationale (string), applicable_rules (list), "
+            "confidence_adjustment (-20 to 20 integer), summary (string), "
+            "risk_flags (list), suggested_tags (list), "
+            "evidence_note (string), confidence_notes (list). "
+            f"Records: {json.dumps(records, ensure_ascii=True, default=str)} "
+            f"Signals: {json.dumps(signals_list, ensure_ascii=True, default=str)}"
+        )
+        max_tokens = min(n * 600, 8192)
+        _sem = semaphore or _asyncio.Semaphore(1)
+        async with _sem:
+            text = await self._chat_completion_async(prompt, max_tokens_override=max_tokens)
+        parsed = self._parse_json_array(text, n)
+        if parsed and len(parsed) == n:
+            return parsed
+        return [self._stub_combined(r) for r in records]
+
+    def _parse_json_array(self, text: str, expected: int) -> list:
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            stripped = stripped.strip("`")
+            if stripped.startswith("json"):
+                stripped = stripped[4:]
+        start = stripped.find("[")
+        if start < 0:
+            return []
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(stripped[start:], start=start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        result = json.loads(stripped[start:i + 1])
+                        if isinstance(result, list):
+                            return result
+                    except json.JSONDecodeError:
+                        return []
+        return []
+
+    async def _chat_completion_async(self, prompt: str, max_tokens_override: int | None = None) -> str:
         messages = [
             {"role": "system", "content": "Return strictly valid JSON."},
             {"role": "user", "content": prompt},
@@ -96,7 +168,7 @@ class LLMClient:
         kwargs: Dict[str, Any] = {
             "messages": messages,
             "temperature": self.settings.llm_temperature,
-            "max_tokens": self.settings.llm_max_tokens,
+            "max_tokens": max_tokens_override or self.settings.llm_max_tokens,
         }
         if self.settings.llm_provider == "azure_openai":
             kwargs.update({
