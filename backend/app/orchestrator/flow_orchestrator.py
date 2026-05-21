@@ -184,6 +184,10 @@ class FlowOrchestrator:
                         "agent_trace": persisted.get("_agentTrace"),
                     },
                 )
+                # Commit every 10 records so the polling endpoint can see them
+                if len(classified_records) % 10 == 0:
+                    db.commit()
+                    emit_progress("classifying records")
 
             emit_progress("classifying records")
 
