@@ -738,7 +738,7 @@ export default function Home() {
     for (let attempt = 0; attempt < 600; attempt += 1) {
       const response = await fetch(statusUrl);
       if (!response.ok) throw new Error(await response.text());
-      const state = (await response.json()) as IngestionJobStatus & { run_id?: string };
+      const state = (await response.json()) as IngestionJobStatus;
 
       if (state.run_id && !runId) runId = state.run_id;
 
@@ -751,8 +751,8 @@ export default function Home() {
         setStatus(`${label} queued...`);
       }
 
-      // Fetch and stream partial records as they are classified
-      if (runId && onPartialRecords && state.status === "processing" && (state.classified ?? 0) > seenCount) {
+      // Poll in-memory store every tick whenever we have a run_id
+      if (runId && onPartialRecords && (state.status === "processing" || state.status === "completed")) {
         try {
           const partial = await fetch(`${appConfig.apiBaseUrl}/api/records/run/${runId}?offset=${seenCount}`);
           if (partial.ok) {
@@ -770,7 +770,7 @@ export default function Home() {
         return state;
       }
       if (state.status === "failed") return state;
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
     throw new Error("Timed out waiting for the ingestion job to complete.");
   }
