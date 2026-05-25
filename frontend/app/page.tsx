@@ -983,7 +983,7 @@ export default function Home() {
   }
 
   const tabs: Array<{ id: TabId; label: string; Icon: LucideIcon; permission: string }> = [
-    { id: "dashboard", label: "Dashboard", Icon: BarChart3, permission: "Finance Review" },
+    { id: "dashboard", label: "Overview", Icon: BarChart3, permission: "Finance Review" },
     { id: "records", label: "Activity Records", Icon: TableProperties, permission: "Classification" },
     { id: "review", label: "Review Queue", Icon: Route, permission: "Team Lead" },
     { id: "analytics", label: "Analytics", Icon: Activity, permission: "Insights" },
